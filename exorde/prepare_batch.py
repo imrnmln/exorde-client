@@ -18,7 +18,7 @@ import datetime
 
 
 wtp = WtP("wtp-canine-s-1l")
-MAX_CONCURRENT_TASKS = 5
+MAX_CONCURRENT_TASKS = 10
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 def split_in_sentences(string: str):
