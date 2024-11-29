@@ -231,7 +231,7 @@ async def process_batch(
     logging.info(f"running batch for {len(batch)}")
 
     # Local concurrency limit
-    max_concurrency = 20
+    max_concurrency = 40
     semaphore = asyncio.Semaphore(max_concurrency)
 
     # Tagging analysis results
