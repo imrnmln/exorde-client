@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from importlib import metadata
 from datetime import datetime
 import numpy as np
@@ -224,65 +225,83 @@ def get_source_type(item: ProtocolItem) -> SourceType:
 
 
 async def process_batch(
-    batch: list[tuple[int, Processed]], static_configuration
+    batch: List[Tuple[int, Processed]], static_configuration: Dict
 ) -> Batch:
     lab_configuration: dict = static_configuration["lab_configuration"]
-    logging.info(f"running batch for {len(batch)}")
+    logging.info(f"Running batch for {len(batch)} items.")
+
+    # Local concurrency limit
+    max_concurrency = 10
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    # Function to process each item under semaphore control
+    async def process_item_with_semaphore(id, processed, analysis):
+        async with semaphore:
+            prot_item: ProtocolItem = ProtocolItem(
+                raw_content=Content(processed.raw_content),
+                translated_content=Content(processed.translation.translation),
+                created_at=processed.item.created_at,
+                domain=processed.item.domain,
+                url=Url(processed.item.url),
+                language=processed.translation.language,
+            )
+            if processed.item.title:
+                prot_item.title = processed.item.title
+            if processed.item.summary:
+                prot_item.summary = processed.item.summary
+            if processed.item.picture:
+                prot_item.picture = processed.item.picture
+            if processed.item.author:
+                prot_item.author = processed.item.author
+            if processed.item.external_id:
+                prot_item.external_id = processed.item.external_id
+            if processed.item.external_parent_id:
+                prot_item.external_parent_id = processed.item.external_parent_id
+
+            completed: ProcessedItem = ProcessedItem(
+                item=prot_item,
+                analysis=ProtocolAnalysis(
+                    classification=analysis.classification,
+                    top_keywords=processed.top_keywords,
+                    language_score=analysis.language_score,
+                    gender=analysis.gender,
+                    sentiment=analysis.sentiment,
+                    embedding=analysis.embedding,
+                    source_type=get_source_type(prot_item),
+                    text_type=analysis.text_type,
+                    emotion=analysis.emotion,
+                    irony=analysis.irony,
+                    age=analysis.age,
+                ),
+                collection_client_version=CollectionClientVersion(
+                    f"exorde:v.{metadata.version('exorde_data')}"
+                ),
+                collection_module=CollectionModule("unknown"),
+                collected_at=CollectedAt(datetime.now().isoformat() + "Z"),
+            )
+            return id, completed
+
+    # Tag translations
     analysis_results: list[Analysis] = tag(
         [processed.translation.translation for (__id__, processed) in batch],
         lab_configuration,
     )
-    complete_processes: dict[int, list[ProcessedItem]] = {}
-    for (id, processed), analysis in zip(batch, analysis_results):
-        prot_item: ProtocolItem = ProtocolItem(
-            raw_content=Content(processed.raw_content),
-            translated_content=Content(processed.translation.translation),
-            created_at=processed.item.created_at,
-            domain=processed.item.domain,
-            url=Url(processed.item.url),
-            language=processed.translation.language,
-        )
 
-        if processed.item.title:
-            prot_item.title = processed.item.title
-        if processed.item.summary:
-            prot_item.summary = processed.item.summary
-        if processed.item.picture:
-            prot_item.picture = processed.item.picture
-        if processed.item.author:
-            prot_item.author = processed.item.author
-        if processed.item.external_id:
-            prot_item.external_id = processed.item.external_id
-        if processed.item.external_parent_id:
-            prot_item.external_parent_id = processed.item.external_parent_id
-        completed: ProcessedItem = ProcessedItem(
-            item=prot_item,
-            analysis=ProtocolAnalysis(
-                classification=analysis.classification,
-                top_keywords=processed.top_keywords,
-                language_score=analysis.language_score,
-                gender=analysis.gender,
-                sentiment=analysis.sentiment,
-                embedding=analysis.embedding,
-                source_type=get_source_type(prot_item),
-                text_type=analysis.text_type,
-                emotion=analysis.emotion,
-                irony=analysis.irony,
-                age=analysis.age,
-            ),
-            collection_client_version=CollectionClientVersion(
-                f"exorde:v.{metadata.version('exorde_data')}"
-            ),
-            collection_module=CollectionModule("unknown"),
-            collected_at=CollectedAt(datetime.now().isoformat() + "Z"),
-        )
-        if not complete_processes.get(id, {}):
-            complete_processes[id] = []
-        complete_processes[id].append(completed)
+    # Process items concurrently
+    tasks = [
+        asyncio.create_task(process_item_with_semaphore(id, processed, analysis))
+        for (id, processed), analysis in zip(batch, analysis_results)
+    ]
+
+    # Wait for all tasks to complete
+    complete_processes = await asyncio.gather(*tasks)
+
+    # Aggregate results
     aggregated = []
-    for __key__, values in complete_processes.items():
+    for __key__, values in complete_processes:
         merged_ = merge_chunks(values)
         if merged_ is not None:
             aggregated.append(merged_)
+
     result_batch: Batch = Batch(items=aggregated, kind=BatchKindEnum.SPOTTING)
     return result_batch
