@@ -225,17 +225,23 @@ def get_source_type(item: ProtocolItem) -> SourceType:
 
 
 async def process_batch(
-    batch: List[Tuple[int, Processed]], static_configuration: Dict
+    batch: list[tuple[int, Processed]], static_configuration
 ) -> Batch:
     lab_configuration: dict = static_configuration["lab_configuration"]
-    logging.info(f"Running batch for {len(batch)} items.")
+    logging.info(f"running batch for {len(batch)}")
 
     # Local concurrency limit
-    max_concurrency = 10
+    max_concurrency = 20
     semaphore = asyncio.Semaphore(max_concurrency)
 
-    # Function to process each item under semaphore control
-    async def process_item_with_semaphore(id, processed, analysis):
+    # Tagging analysis results
+    analysis_results: list[Analysis] = tag(
+        [processed.translation.translation for (__id__, processed) in batch],
+        lab_configuration,
+    )
+
+    # Process items concurrently with semaphore
+    async def process_item(id, processed, analysis):
         async with semaphore:
             prot_item: ProtocolItem = ProtocolItem(
                 raw_content=Content(processed.raw_content),
@@ -245,6 +251,7 @@ async def process_batch(
                 url=Url(processed.item.url),
                 language=processed.translation.language,
             )
+
             if processed.item.title:
                 prot_item.title = processed.item.title
             if processed.item.summary:
@@ -281,27 +288,28 @@ async def process_batch(
             )
             return id, completed
 
-    # Tag translations
-    analysis_results: list[Analysis] = tag(
-        [processed.translation.translation for (__id__, processed) in batch],
-        lab_configuration,
-    )
-
-    # Process items concurrently
+    # Create tasks for each item in the batch
     tasks = [
-        asyncio.create_task(process_item_with_semaphore(id, processed, analysis))
+        process_item(id, processed, analysis)
         for (id, processed), analysis in zip(batch, analysis_results)
     ]
 
-    # Wait for all tasks to complete
-    complete_processes = await asyncio.gather(*tasks)
+    # Await all tasks
+    results = await asyncio.gather(*tasks)
 
     # Aggregate results
+    complete_processes: dict[int, list[ProcessedItem]] = {}
+    for id, completed in results:
+        if not complete_processes.get(id, {}):
+            complete_processes[id] = []
+        complete_processes[id].append(completed)
+
     aggregated = []
-    for __key__, values in complete_processes:
+    for __key__, values in complete_processes.items():
         merged_ = merge_chunks(values)
         if merged_ is not None:
             aggregated.append(merged_)
 
     result_batch: Batch = Batch(items=aggregated, kind=BatchKindEnum.SPOTTING)
     return result_batch
+
