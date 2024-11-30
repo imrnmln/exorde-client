@@ -106,55 +106,63 @@ def initialize_models(device):
     return models
 
 def tag(documents: list[str], lab_configuration):
+    # loading from lab configuration, previously initialized
     models = lab_configuration["models"]
-    assert all(isinstance(doc, str) for doc in documents)
+    
+    for doc in documents:
+        assert isinstance(doc, str)
 
     tmp = pd.DataFrame()
     tmp["Translation"] = documents
-    assert tmp["Translation"] is not None and len(tmp["Translation"]) > 0
 
-    logging.info("Starting Tagging Batch pipeline...")
+    assert tmp["Translation"] is not None
+    assert len(tmp["Translation"]) > 0    
 
-    # Define helper functions
-    def compute_embedding(text):
-        model = models['sentence_transformer']
-        return list(model.encode(text).astype(float))
+    logging.info("Starting Tagging Batch pipeline using thread...")
+    model = models['sentence_transformer']
+    
+    # Using ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        tmp["Embedding"] = tmp["Translation"].swifter.apply(
+            lambda x: list(executor.submit(model.encode, x).result())
+        )
 
-    def classify_text(text):
         zs_pipe = models['zs_pipe']
         classification_labels = list(lab_configuration["labeldict"].keys())
-        return zs_pipe(text, candidate_labels=classification_labels)
+        tmp["Classification"] = tmp["Translation"].swifter.apply(
+            lambda x: zs_pipe(x, candidate_labels=classification_labels)
+        )
 
-    def classify_emotion_irony_texttype(text):
-        results = {}
         text_classification_models = ["Emotion", "Irony", "TextType"]
         for col_name in text_classification_models:
             pipe = models[col_name]
-            results[col_name] = [(y["label"], float(y["score"])) for y in pipe(text)[0]]
-        return results
+            tmp[col_name] = tmp["Translation"].swifter.apply(
+                lambda x: [(y["label"], float(y["score"])) for y in pipe(x)[0]]
+            )
 
-    def tokenize_text(text):
         tokenizer = models['bert_tokenizer']
-        return np.array(
-            tokenizer.encode_plus(
-                text,
-                add_special_tokens=True,
-                max_length=512,
-                truncation=True,
-                padding="max_length",
-                return_attention_mask=False,
-                return_tensors="tf",
-            )["input_ids"][0]
-        ).reshape(1, -1)
+        tmp["Embedded"] = tmp["Translation"].swifter.apply(
+            lambda x: np.array(
+                tokenizer.encode_plus(
+                    x,
+                    add_special_tokens=True,
+                    max_length=512,
+                    truncation=True,
+                    padding="max_length",
+                    return_attention_mask=False,
+                    return_tensors="tf",
+                )["input_ids"][0]
+            ).reshape(1, -1)
+        )
 
-    def compute_sentiment_scores(text):
         sentiment_analyzer = models['sentiment_analyzer']
         fdb_pipe = models['fdb_pipe']
         gdb_pipe = models['gdb_pipe']
 
+        # Sentiment Functions
         def vader_sentiment(text):
             return round(sentiment_analyzer.polarity_scores(text)["compound"], 2)
-
+        
         def fin_vader_sentiment(text):
             return round(finvader(text, use_sentibignomics=True, use_henry=True, indicator='compound'), 2)
 
@@ -167,12 +175,12 @@ def tag(documents: list[str], lab_configuration):
             prediction = gdb_pipe(text)
             gen_distilbert_sent = {e["label"]: round(e["score"], 3) for e in prediction[0]}
             return round(gen_distilbert_sent["positive"] - gen_distilbert_sent["negative"], 3)
-
+        
         def compounded_financial_sentiment(text):
             fin_vader_sent = fin_vader_sentiment(text)
             fin_distil_score = fdb_sentiment(text)
             return round((0.70 * fin_distil_score + 0.30 * fin_vader_sent), 2)
-
+            
         def compounded_sentiment(text):
             gen_distilbert_sentiment = gdb_sentiment(text)
             vader_sent = vader_sentiment(text)
@@ -186,33 +194,14 @@ def tag(documents: list[str], lab_configuration):
             else:
                 return round((0.60 * gen_distilbert_sentiment + 0.40 * vader_sent), 2)
 
-        return {
-            "Sentiment": compounded_sentiment(text),
-            "FinancialSentiment": compounded_financial_sentiment(text),
-        }
+        # Sentiment processing with parallelism
+        tmp["Sentiment"] = tmp["Translation"].swifter.apply(
+            lambda x: list(executor.submit(compounded_sentiment, x).result())
+        )
 
-    # Process columns using swifter.apply with threading for concurrency
-    logging.info(f"[Item tagging] Process data using thread")
-    with ThreadPoolExecutor() as executor:
-        tmp["Embedding"] = tmp["Translation"].swifter.apply(
-            lambda x: executor.submit(compute_embedding, x).result()
+        tmp["FinancialSentiment"] = tmp["Translation"].swifter.apply(
+            lambda x: list(executor.submit(compounded_financial_sentiment, x).result())
         )
-        tmp["Classification"] = tmp["Translation"].swifter.apply(
-            lambda x: executor.submit(classify_text, x).result()
-        )
-        emotion_irony_texttype_results = tmp["Translation"].swifter.apply(
-            lambda x: executor.submit(classify_emotion_irony_texttype, x).result()
-        )
-        for col_name in ["Emotion", "Irony", "TextType"]:
-            tmp[col_name] = emotion_irony_texttype_results.apply(lambda x: x[col_name])
-        tmp["Embedded"] = tmp["Translation"].swifter.apply(
-            lambda x: executor.submit(tokenize_text, x).result()
-        )
-        sentiment_results = tmp["Translation"].swifter.apply(
-            lambda x: executor.submit(compute_sentiment_scores, x).result()
-        )
-        tmp["Sentiment"] = sentiment_results.apply(lambda x: x["Sentiment"])
-        tmp["FinancialSentiment"] = sentiment_results.apply(lambda x: x["FinancialSentiment"])
 
     del tmp["Embedded"]
     tmp = tmp.to_dict(orient="records")
