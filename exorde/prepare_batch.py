@@ -220,10 +220,12 @@ async def prepare_batch(
                     )
 
         # Add the task to the task list
+        logging.info("Add to task")
         tasks.append(process_item())
-
+        logging.info("Processing item")
         if diff > 90 and len(batch) >= 5:
             logging.info("Early-Stop current batch to prevent data-aging")
+            return batch
             break
 
         # Evaluate the maximum allowed cumulated token count in batch
@@ -248,9 +250,11 @@ async def prepare_batch(
             cumulative_token_size > max_batch_total_tokens_
             or len(batch) >= selected_batch_size  # add spent_time notion
         ):
+            return batch
             break
 
     # Wait for all tasks to complete before returning the batch
+    logging.info("Run all task")
     await asyncio.gather(*tasks)
 
     return batch
