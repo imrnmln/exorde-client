@@ -197,6 +197,7 @@ def tag(documents: list[str], lab_configuration):
     tmp = tmp.to_dict(orient="records")
 
     _out = []
+    logging.info(f"[Item tagging] Data length {len(tmp)}")
     for i in range(len(tmp)):
         # add Sentiment
         sentiment = Sentiment(tmp[i]["Sentiment"])
