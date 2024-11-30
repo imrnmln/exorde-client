@@ -192,6 +192,7 @@ def tag(documents: list[str], lab_configuration):
         }
 
     # Process columns using swifter.apply with threading for concurrency
+    logging.info(f"[Item tagging] Process data using thread")
     with ThreadPoolExecutor() as executor:
         tmp["Embedding"] = tmp["Translation"].swifter.apply(
             lambda x: executor.submit(compute_embedding, x).result()
