@@ -1,6 +1,6 @@
 import logging
 import time
-import asyncio
+
 from typing import AsyncGenerator
 import argparse
 from wtpsplit import WtP
@@ -18,8 +18,7 @@ import datetime
 
 
 wtp = WtP("wtp-canine-s-1l")
-MAX_CONCURRENT_TASKS = 20
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+
 
 def split_in_sentences(string: str):
     sentences = []
@@ -108,73 +107,6 @@ def split_item(item: Item, max_token_count: int) -> list[Item]:
         ]
 
 
-async def process_item(item, item_id, lab_configuration, max_depth_classification, batch, websocket_send, spotting_identifier, live_configuration):
-    start_time = time.perf_counter()
-    try:
-        processed_item: Processed = await process(
-            item, lab_configuration, max_depth_classification
-        )
-        batch.append((item_id, processed_item))
-        await websocket_send(
-            {
-                "jobs": {
-                    spotting_identifier: {
-                        "items": {
-                            str(item_id): {
-                                "collection_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "domain": str(item.domain),
-                                "url": str(item.url),
-                            }
-                        }
-                    }
-                }
-            }
-        )
-    except TooBigError:
-        logging.info("\n_________ Paragraph maker __________________")
-        splitted: list[Item] = split_item(item, live_configuration["max_token_count"])
-        # Process each chunk in parallel
-        chunk_tasks = []
-        for i, chunk in enumerate(splitted):
-            logging.info(f"\t\t[Paragraph] Sub-split item {i} = {chunk}")
-            chunk_tasks.append(process_chunk(chunk, item_id, lab_configuration, max_depth_classification, batch, websocket_send, spotting_identifier))
-        await asyncio.gather(*chunk_tasks)
-
-    end_time = time.perf_counter()
-    exec_time_s = end_time - start_time
-    item_token_count = evaluate_token_count(str(item.content))
-    logging.info(
-        f" + A new item has been processed {len(batch)} - ({exec_time_s} s) - Source = {str(item['domain'])} - token count = {item_token_count}"
-    )
-
-async def process_chunk(chunk, item_id, lab_configuration, max_depth_classification, batch, websocket_send, spotting_identifier):
-    start_time = time.perf_counter()
-    processed_chunk: Processed = await process(chunk, lab_configuration, max_depth_classification)
-    batch.append((item_id, processed_chunk))
-    await websocket_send(
-        {
-            "jobs": {
-                spotting_identifier: {
-                    "items": {
-                        str(item_id): {
-                            "collection_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "domain": str(chunk.domain),
-                            "url": str(chunk.url),
-                        }
-                    }
-                }
-            }
-        }
-    )
-
-    item_token_count_ = evaluate_token_count(str(chunk.content))
-    end_time = time.perf_counter()
-    exec_time_s = end_time - start_time
-    logging.info(
-        f"[PARAGRAPH MODE] + A new sub-item has been processed {len(batch)} - ({exec_time_s} s) - Source = {str(chunk['domain'])} - token count = {item_token_count_}"
-    )
-
-
 async def prepare_batch(
     static_configuration: StaticConfiguration,
     live_configuration: LiveConfiguration,
@@ -198,37 +130,127 @@ async def prepare_batch(
 
     gather_time = time.time()
     times = [time.time()]  # [prepare_batch_start_time, ... item.recolt_time]
-    tasks = []
+    semaphore = asyncio.Semaphore(20)  # Limit to 20 concurrent tasks
+
+    tasks = []  # Store tasks
+
     async for item in generator:
         diff = time.time() - gather_time
         gather_time = time.time()
         times.append(gather_time)
         item_id += 1
+        
+        # Create the task to process the item within the semaphore
+        async def process_item():
+            async with semaphore:  # Limit concurrent tasks
+                start_time: float = time.perf_counter()
+                splitted_mode = False
+                try:
+                    processed_item: Processed = await process(
+                        item, lab_configuration, max_depth_classification
+                    )
+                    batch.append((item_id, processed_item))
+                    await websocket_send(
+                        {
+                            "jobs": {
+                                spotting_identifier: {
+                                    "items": {
+                                        str(item_id): {
+                                            "collection_time": datetime.datetime.now().strftime(
+                                                "%Y-%m-%d %H:%M:%S"
+                                            ),
+                                            "domain": str(item.domain),
+                                            "url": str(item.url),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    )
 
-        # Use the semaphore to limit the number of concurrent tasks
-        async with semaphore:
-            task = process_item(item, item_id, lab_configuration, max_depth_classification, batch, websocket_send, spotting_identifier, live_configuration)
-            tasks.append(task)
+                except TooBigError:
+                    logging.info("\n_________ Paragraph maker __________________")
+                    splitted: list[Item] = split_item(
+                        item, live_configuration["max_token_count"]
+                    )
+                    splitted_mode = True
+                    # print all splitted items with index
+                    for i, item in enumerate(splitted):
+                        logging.info(
+                            f"\t\t[Paragraph] Sub-split item {i} = {item}"
+                        )
+                    for chunk in splitted:
+                        processed_chunk: Processed = await process(
+                            chunk, lab_configuration, max_depth_classification
+                        )
+                        batch.append((item_id, processed_chunk))
+                        await websocket_send(
+                            {
+                                "jobs": {
+                                    spotting_identifier: {
+                                        "items": {
+                                            str(item_id): {
+                                                "collection_time": datetime.datetime.now().strftime(
+                                                    "%Y-%m-%d %H:%M:%S"
+                                                ),
+                                                "domain": str(item.domain),
+                                                "url": str(item.url),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        )
 
-        # Check if batch size or token count limit is reached
+                        item_token_count_ = evaluate_token_count(
+                            str(chunk.content)
+                        )
+                        end_time: float = time.perf_counter()
+                        exec_time_s: float = end_time - start_time
+                        logging.info(
+                            f"[PARAGRAPH MODE] + A new sub-item has been processed {len(batch)}/{selected_batch_size} - ({exec_time_s} s) - Source = {str(item['domain'])} -  token count = {item_token_count_}"
+                        )
+
+                if not splitted_mode:
+                    end_time: float = time.perf_counter()
+                    item_token_count = evaluate_token_count(str(item.content))
+                    exec_time_s: float = end_time - start_time
+                    logging.info(
+                        f" + A new item has been processed {len(batch)}/{selected_batch_size} - ({exec_time_s} s) - Source = {str(item['domain'])} -  token count = {item_token_count}"
+                    )
+
+        # Add the task to the task list
+        tasks.append(process_item())
+
         if diff > 90 and len(batch) >= 5:
             logging.info("Early-Stop current batch to prevent data-aging")
-            await asyncio.gather(*tasks)  # Ensure all tasks are completed before returning
-            return batch
+            break
 
+        # Evaluate the maximum allowed cumulated token count in batch
         try:
-            max_batch_total_tokens_ = int(live_configuration["batch_size"]) * int(live_configuration["max_token_count"])
+            max_batch_total_tokens_ = int(
+                live_configuration["batch_size"]
+            ) * int(live_configuration["max_token_count"])
         except:
             max_batch_total_tokens_ = 30000  # default value
 
         # Evaluate the cumulated number of tokens in the batch
-        cumulative_token_size = sum([evaluate_token_count(str(item.item.content)) for (__id__, item) in batch])
-        if cumulative_token_size > max_batch_total_tokens_ or len(batch) >= selected_batch_size:
-            logging.info("Batch reached max size or token limit, processing batch.")
-            await asyncio.gather(*tasks)  # Ensure all tasks are completed
-            return batch
+        try:
+            cumulative_token_size = sum(
+                [
+                    evaluate_token_count(str(item.item.content))
+                    for (__id__, item) in batch
+                ]
+            )
+        except:
+            cumulative_token_size = 150 * len(batch)
+        if (
+            cumulative_token_size > max_batch_total_tokens_
+            or len(batch) >= selected_batch_size  # add spent_time notion
+        ):
+            break
 
-    # Ensure all remaining tasks are completed before returning
-    if tasks:
-        await asyncio.gather(*tasks)
-    return []
+    # Wait for all tasks to complete before returning the batch
+    await asyncio.gather(*tasks)
+
+    return batch
