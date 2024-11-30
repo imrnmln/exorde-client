@@ -289,6 +289,7 @@ async def process_batch(
             return id, completed
 
     # Create tasks for each item in the batch
+    logging.info(f"Let's processing the item using task")
     tasks = [
         process_item(id, processed, analysis)
         for (id, processed), analysis in zip(batch, analysis_results)
@@ -305,6 +306,7 @@ async def process_batch(
         complete_processes[id].append(completed)
 
     aggregated = []
+    logging.info(f"[Item merging] Check if we need to merge it")
     for __key__, values in complete_processes.items():
         merged_ = merge_chunks(values)
         if merged_ is not None:
