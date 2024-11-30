@@ -40,6 +40,7 @@ setup(
         "fasttext-langdetect==1.0.5",
         "huggingface_hub==0.14.1",
         "pandas==1.5.3",
+        "modin[ray]==0.19.0",
         "sentence-transformers==2.2.2",
         "spacy==3.5.1",
         "swifter==1.3.4",
