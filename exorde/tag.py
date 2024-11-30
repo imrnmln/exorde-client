@@ -1,6 +1,7 @@
 import json
 import pandas as pd
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 from finvader import finvader
@@ -105,43 +106,38 @@ def initialize_models(device):
     return models
 
 def tag(documents: list[str], lab_configuration):
-    # loading from lab configuration, previously initialized
     models = lab_configuration["models"]
-    
-    for doc in documents:
-        assert isinstance(doc, str)
+    assert all(isinstance(doc, str) for doc in documents)
 
     tmp = pd.DataFrame()
     tmp["Translation"] = documents
-
-    assert tmp["Translation"] is not None
-    assert len(tmp["Translation"]) > 0    
+    assert tmp["Translation"] is not None and len(tmp["Translation"]) > 0
 
     logging.info("Starting Tagging Batch pipeline...")
-    model = models['sentence_transformer']
-    tmp["Embedding"] = tmp["Translation"].swifter.apply(
-        lambda x: list(model.encode(x).astype(float))
-    )
 
-    zs_pipe = models['zs_pipe']
-    classification_labels = list(lab_configuration["labeldict"].keys())
-    tmp["Classification"] = tmp["Translation"].swifter.apply(
-        lambda x: zs_pipe(x, candidate_labels=classification_labels)
-    )
+    # Define helper functions
+    def compute_embedding(text):
+        model = models['sentence_transformer']
+        return list(model.encode(text).astype(float))
 
+    def classify_text(text):
+        zs_pipe = models['zs_pipe']
+        classification_labels = list(lab_configuration["labeldict"].keys())
+        return zs_pipe(text, candidate_labels=classification_labels)
 
-    text_classification_models = ["Emotion", "Irony", "TextType"]
-    for col_name in text_classification_models:
-        pipe = models[col_name]
-        tmp[col_name] = tmp["Translation"].swifter.apply(
-            lambda x: [(y["label"], float(y["score"])) for y in pipe(x)[0]]
-        )
+    def classify_emotion_irony_texttype(text):
+        results = {}
+        text_classification_models = ["Emotion", "Irony", "TextType"]
+        for col_name in text_classification_models:
+            pipe = models[col_name]
+            results[col_name] = [(y["label"], float(y["score"])) for y in pipe(text)[0]]
+        return results
 
-    tokenizer = models['bert_tokenizer']
-    tmp["Embedded"] = tmp["Translation"].swifter.apply(
-        lambda x: np.array(
+    def tokenize_text(text):
+        tokenizer = models['bert_tokenizer']
+        return np.array(
             tokenizer.encode_plus(
-                x,
+                text,
                 add_special_tokens=True,
                 max_length=512,
                 truncation=True,
@@ -150,48 +146,72 @@ def tag(documents: list[str], lab_configuration):
                 return_tensors="tf",
             )["input_ids"][0]
         ).reshape(1, -1)
-    )
 
-    sentiment_analyzer = models['sentiment_analyzer']
-    fdb_pipe = models['fdb_pipe']
-    gdb_pipe = models['gdb_pipe']
+    def compute_sentiment_scores(text):
+        sentiment_analyzer = models['sentiment_analyzer']
+        fdb_pipe = models['fdb_pipe']
+        gdb_pipe = models['gdb_pipe']
 
-    def vader_sentiment(text):
-        return round(sentiment_analyzer.polarity_scores(text)["compound"], 2)
-    
-    def fin_vader_sentiment(text):
-        return round(finvader(text, use_sentibignomics=True, use_henry=True, indicator='compound'), 2)
+        def vader_sentiment(text):
+            return round(sentiment_analyzer.polarity_scores(text)["compound"], 2)
 
-    def fdb_sentiment(text):
-        prediction = fdb_pipe(text)
-        fdb_sentiment_dict = {e["label"]: round(e["score"], 3) for e in prediction[0]}
-        return round(fdb_sentiment_dict["positive"] - fdb_sentiment_dict["negative"], 3)
+        def fin_vader_sentiment(text):
+            return round(finvader(text, use_sentibignomics=True, use_henry=True, indicator='compound'), 2)
 
-    def gdb_sentiment(text):
-        prediction = gdb_pipe(text)
-        gen_distilbert_sent = {e["label"]: round(e["score"], 3) for e in prediction[0]}
-        return round(gen_distilbert_sent["positive"] - gen_distilbert_sent["negative"], 3)
-    
-    def compounded_financial_sentiment(text):
-        fin_vader_sent = fin_vader_sentiment(text)
-        fin_distil_score = fdb_sentiment(text)
-        return round((0.70 * fin_distil_score + 0.30 * fin_vader_sent), 2)
-        
-    def compounded_sentiment(text):
-        gen_distilbert_sentiment = gdb_sentiment(text)
-        vader_sent = vader_sentiment(text)
-        compounded_fin_sentiment = compounded_financial_sentiment(text)
-        if abs(compounded_fin_sentiment) >= 0.6:
-            return round((0.30 * gen_distilbert_sentiment + 0.10 * vader_sent + 0.60 * compounded_fin_sentiment), 2)
-        elif abs(compounded_fin_sentiment) >= 0.4:
-            return round((0.40 * gen_distilbert_sentiment + 0.20 * vader_sent + 0.40 * compounded_fin_sentiment), 2)
-        elif abs(compounded_fin_sentiment) >= 0.1:
-            return round((0.60 * gen_distilbert_sentiment + 0.25 * vader_sent + 0.15 * compounded_fin_sentiment), 2)
-        else:
-            return round((0.60 * gen_distilbert_sentiment + 0.40 * vader_sent), 2)
+        def fdb_sentiment(text):
+            prediction = fdb_pipe(text)
+            fdb_sentiment_dict = {e["label"]: round(e["score"], 3) for e in prediction[0]}
+            return round(fdb_sentiment_dict["positive"] - fdb_sentiment_dict["negative"], 3)
 
-    tmp["Sentiment"] = tmp["Translation"].swifter.apply(compounded_sentiment)
-    tmp["FinancialSentiment"] = tmp["Translation"].swifter.apply(compounded_financial_sentiment)
+        def gdb_sentiment(text):
+            prediction = gdb_pipe(text)
+            gen_distilbert_sent = {e["label"]: round(e["score"], 3) for e in prediction[0]}
+            return round(gen_distilbert_sent["positive"] - gen_distilbert_sent["negative"], 3)
+
+        def compounded_financial_sentiment(text):
+            fin_vader_sent = fin_vader_sentiment(text)
+            fin_distil_score = fdb_sentiment(text)
+            return round((0.70 * fin_distil_score + 0.30 * fin_vader_sent), 2)
+
+        def compounded_sentiment(text):
+            gen_distilbert_sentiment = gdb_sentiment(text)
+            vader_sent = vader_sentiment(text)
+            compounded_fin_sentiment = compounded_financial_sentiment(text)
+            if abs(compounded_fin_sentiment) >= 0.6:
+                return round((0.30 * gen_distilbert_sentiment + 0.10 * vader_sent + 0.60 * compounded_fin_sentiment), 2)
+            elif abs(compounded_fin_sentiment) >= 0.4:
+                return round((0.40 * gen_distilbert_sentiment + 0.20 * vader_sent + 0.40 * compounded_fin_sentiment), 2)
+            elif abs(compounded_fin_sentiment) >= 0.1:
+                return round((0.60 * gen_distilbert_sentiment + 0.25 * vader_sent + 0.15 * compounded_fin_sentiment), 2)
+            else:
+                return round((0.60 * gen_distilbert_sentiment + 0.40 * vader_sent), 2)
+
+        return {
+            "Sentiment": compounded_sentiment(text),
+            "FinancialSentiment": compounded_financial_sentiment(text),
+        }
+
+    # Process columns using swifter.apply with threading for concurrency
+    with ThreadPoolExecutor() as executor:
+        tmp["Embedding"] = tmp["Translation"].swifter.apply(
+            lambda x: executor.submit(compute_embedding, x).result()
+        )
+        tmp["Classification"] = tmp["Translation"].swifter.apply(
+            lambda x: executor.submit(classify_text, x).result()
+        )
+        emotion_irony_texttype_results = tmp["Translation"].swifter.apply(
+            lambda x: executor.submit(classify_emotion_irony_texttype, x).result()
+        )
+        for col_name in ["Emotion", "Irony", "TextType"]:
+            tmp[col_name] = emotion_irony_texttype_results.apply(lambda x: x[col_name])
+        tmp["Embedded"] = tmp["Translation"].swifter.apply(
+            lambda x: executor.submit(tokenize_text, x).result()
+        )
+        sentiment_results = tmp["Translation"].swifter.apply(
+            lambda x: executor.submit(compute_sentiment_scores, x).result()
+        )
+        tmp["Sentiment"] = sentiment_results.apply(lambda x: x["Sentiment"])
+        tmp["FinancialSentiment"] = sentiment_results.apply(lambda x: x["FinancialSentiment"])
 
     del tmp["Embedded"]
     tmp = tmp.to_dict(orient="records")
