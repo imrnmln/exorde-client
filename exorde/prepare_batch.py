@@ -198,6 +198,7 @@ async def prepare_batch(
 
     gather_time = time.time()
     times = [time.time()]  # [prepare_batch_start_time, ... item.recolt_time]
+    tasks = []
     async for item in generator:
         diff = time.time() - gather_time
         gather_time = time.time()
