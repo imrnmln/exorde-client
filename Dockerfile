@@ -3,7 +3,7 @@ FROM python:3.10.11
 # Update and install dependencies
 RUN apt-get update \
     && apt-get upgrade -y \
-    && apt-get install -y chromium chromium-driver xvfb socat \
+    && apt-get install -y chromium chromium-driver xvfb socat gcc \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/chromedriver  /usr/local/bin/chromedriver
