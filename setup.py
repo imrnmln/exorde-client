@@ -55,7 +55,8 @@ setup(
         "vaderSentiment==3.3.2",
         "yake==0.4.8",
         "argostranslate==1.9.6",
-        "wtpsplit==1.3.0"
+        "wtpsplit==1.3.0",
+        "scikit-learn"
     ],
     python_requires=">=3.10",
 )
