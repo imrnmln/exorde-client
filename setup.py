@@ -46,7 +46,7 @@ setup(
         "sphinx>=4.0, <5.0",
         "sphinx_rtd_theme>=0.5",
         "nbsphinx>=0.5",
-        "datatable==1.0.0",
+        "datatable",
         "sentence-transformers==2.2.2",
         "spacy==3.5.1",
         "swifter==1.3.4",
